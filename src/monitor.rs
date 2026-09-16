@@ -36,11 +36,10 @@ use std::ffi::c_void;
 use std::ptr::null;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::SystemInformation::{
-    GetLocalTime, GetSystemDirectoryW, GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX,
-    SYSTEM_INFO,
+    GetSystemDirectoryW, GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, INFINITE,
@@ -63,8 +62,6 @@ pub struct Status {
     pub mem: u64,
     /// `mem` as a percentage of the host's physical RAM.
     pub mem_pct: f64,
-    /// Local wall-clock time of the last sample (hh, mm, ss), if any.
-    pub updated: Option<(u16, u16, u16)>,
 }
 
 /// Stateful sampler: remembers the previous CPU reading so the next one can
@@ -184,10 +181,7 @@ impl Monitor {
 
         let Some((pid, cpu_time, ws)) = found else {
             let changed = self.cur.running;
-            self.cur = Status {
-                updated: Some(local_time()),
-                ..Status::default()
-            };
+            self.cur = Status::default();
             self.last_pid = 0;
             return (self.cur, changed);
         };
@@ -200,7 +194,6 @@ impl Monitor {
                 cpu: None,
                 mem: ws,
                 mem_pct: self.mem_pct(ws),
-                updated: Some(local_time()),
             };
             self.last_pid = pid;
             self.last_t = now;
@@ -225,7 +218,6 @@ impl Monitor {
         }
         self.cur.mem = ws;
         self.cur.mem_pct = self.mem_pct(ws);
-        self.cur.updated = Some(local_time());
         (self.cur, true)
     }
 
@@ -320,41 +312,36 @@ fn total_phys_mem() -> u64 {
     ms.ullTotalPhys
 }
 
-/// Local (hour, minute, second) for the "updated" line of the tooltip.
-fn local_time() -> (u16, u16, u16) {
-    let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut t) };
-    (t.wHour, t.wMinute, t.wSecond)
-}
-
-/// Runs `wsl.exe --shutdown` with no console window, waits for it, and
-/// fails with the exit code if it is non-zero.
-///
-/// Uses `CreateProcessW` directly instead of `std::process::Command`: the
-/// latter pulls in about 67 KB of pipe and environment handling for a call
-/// whose output is not needed. The executable is given by full path
-/// (`%SystemRoot%\System32\wsl.exe`) so that, unlike a bare command line,
-/// the current directory is never searched for a `wsl.exe`.
-///
-/// This is called from a helper thread, not the UI thread, because it blocks
-/// for as long as the shutdown takes (a few seconds).
-pub fn shutdown_wsl() -> Result<(), String> {
+/// Resolves `%SystemRoot%\System32\wsl.exe` as a NUL-terminated wide string.
+/// Used instead of a bare `wsl.exe` command line so the current directory is
+/// never searched for one.
+fn wsl_exe_path() -> Result<Vec<u16>, String> {
     let mut dir = [0u16; 260];
     let n = unsafe { GetSystemDirectoryW(dir.as_mut_ptr(), dir.len() as u32) } as usize;
     if n == 0 || n >= dir.len() {
-        return Err(format!(
-            "wsl --shutdown: GetSystemDirectory failed ({})",
-            unsafe { GetLastError() }
-        ));
+        return Err(format!("GetSystemDirectory failed ({})", unsafe {
+            GetLastError()
+        }));
     }
     let mut exe = dir[..n].to_vec();
     exe.extend(wide(r"\wsl.exe"));
-    let mut cmdline = wide("wsl.exe --shutdown"); // CreateProcessW may modify it
+    Ok(exe)
+}
+
+/// Starts `wsl.exe <args>` with no visible console window and returns its
+/// process/thread handles without waiting for it.
+///
+/// Uses `CreateProcessW` directly instead of `std::process::Command`: the
+/// latter pulls in about 67 KB of pipe and environment handling that is
+/// never needed here.
+fn spawn_wsl(args: &str) -> Result<PROCESS_INFORMATION, String> {
+    let exe = wsl_exe_path()?;
+    let mut cmdline = wide(&format!("wsl.exe {args}")); // CreateProcessW may modify it
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    unsafe {
-        let ok = CreateProcessW(
+    let ok = unsafe {
+        CreateProcessW(
             exe.as_ptr(),
             cmdline.as_mut_ptr(),
             null(),
@@ -365,23 +352,67 @@ pub fn shutdown_wsl() -> Result<(), String> {
             null(),
             &si,
             &mut pi,
-        );
-        if ok == 0 {
-            return Err(format!(
-                "wsl --shutdown: CreateProcess failed ({})",
-                GetLastError()
-            ));
-        }
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "wsl.exe {args}: CreateProcess failed ({})",
+            unsafe { GetLastError() }
+        ));
+    }
+    Ok(pi)
+}
+
+/// Runs `wsl.exe <args>` to completion and fails with its exit code if it is
+/// non-zero. Blocks for as long as the command takes, so callers run this on
+/// a helper thread, never on the UI thread.
+fn run_wsl(args: &str) -> Result<(), String> {
+    let pi = spawn_wsl(args)?;
+    unsafe {
         CloseHandle(pi.hThread);
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code = 0u32;
         GetExitCodeProcess(pi.hProcess, &mut code);
         CloseHandle(pi.hProcess);
         if code != 0 {
-            return Err(format!("wsl --shutdown: exit status {code}"));
+            return Err(format!("wsl.exe {args}: exit status {code}"));
         }
     }
     Ok(())
+}
+
+/// Runs `wsl.exe --shutdown`: stops the WSL2 VM and every distribution
+/// running in it.
+pub fn shutdown_wsl() -> Result<(), String> {
+    run_wsl("--shutdown")
+}
+
+/// Boots the WSL2 VM (and, if given, a specific distribution) by running
+/// `wsl.exe [--distribution <distro>] -- exit`, exactly as typing that into
+/// Win+R would: waits for the trivial `exit` command to return and then
+/// leaves no process of its own running. Whether the VM stays up afterwards
+/// is up to `.wslconfig`'s own `vmIdleTimeout`, not this app. An empty
+/// `distro` omits `--distribution`, so WSL starts whichever distribution it
+/// picks by default.
+pub fn start_wsl(distro: &str) -> Result<(), String> {
+    let args = if distro.is_empty() {
+        "-- exit".to_string()
+    } else {
+        format!("--distribution {} -- exit", quote_arg(distro))
+    };
+    run_wsl(&args)
+}
+
+/// Wraps `s` in double quotes if it contains whitespace, for building a
+/// `wsl.exe` command line. Distribution names cannot themselves contain
+/// quotes, so no further escaping is needed. Also used by `main` to build
+/// the equivalent command line for the Terminal menu command.
+pub fn quote_arg(s: &str) -> String {
+    if s.contains(char::is_whitespace) {
+        format!("\"{s}\"")
+    } else {
+        s.to_string()
+    }
 }
 
 /// `768 MB` below 1 GiB, otherwise `5.40 GB` (binary units, two decimals).
@@ -403,6 +434,13 @@ mod tests {
         assert_eq!(format_bytes(600 << 20), "600 MB");
         assert_eq!(format_bytes(1024 << 20), "1.00 GB");
         assert_eq!(format_bytes((5 << 30) + (1 << 29)), "5.50 GB");
+    }
+
+    #[test]
+    fn quotes_args_only_when_needed() {
+        assert_eq!(quote_arg("Ubuntu"), "Ubuntu");
+        assert_eq!(quote_arg("Ubuntu 22.04"), "\"Ubuntu 22.04\"");
+        assert_eq!(quote_arg(""), "");
     }
 
     #[test]

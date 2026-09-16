@@ -1,39 +1,66 @@
 //! wsl-tray: a tray indicator for WSL2 (on/off, CPU and memory share of the
-//! host, shutdown from the menu). Pure Win32 through `windows-sys`.
+//! host, start/restart/shutdown from the menu). Pure Win32 through
+//! `windows-sys`.
 //!
 //! # How the program is put together
 //!
 //! ```text
-//!  main()            parse flags, single-instance mutex, create App
+//!  main()            parse flags, load config, single-instance mutex, create App
 //!    |
 //!    +-- create_window()      hidden top-level window; owns the tray icon,
 //!    |                        receives its callbacks and the poll timer
 //!    +-- add_tray_icon()      Shell_NotifyIconW(NIM_ADD), version 4
+//!    +-- sync_app_autostart() writes/deletes the Run key per autostart
+//!    +-- start() if autoboot  boots WSL2 in the background
 //!    +-- SetTimer(-poll)      WM_TIMER every 5 s by default
 //!    +-- message loop         GetMessageW / DispatchMessageW until WM_QUIT
 //!
 //!  wnd_proc -> App::handle
 //!    WM_TIMER          -> tick(): Monitor::poll(), redraw icon/tooltip if changed
 //!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu
-//!    WM_REFRESH_NOW    -> tick(true), posted by the shutdown thread when done
+//!    WM_REFRESH_NOW    -> tick(true), posted by the Start/Restart/Shutdown
+//!                         thread when its `wsl.exe` command(s) are done
 //!    TaskbarCreated    -> add_tray_icon() again after an Explorer restart
-//!    WM_DESTROY        -> remove the icon, PostQuitMessage
+//!    WM_DESTROY        -> remove the icon, PostQuitMessage (WSL2 itself is
+//!                         left running; see below)
 //! ```
 //!
 //! The modules split as follows:
 //!
-//! * [`monitor`] finds the WSL2 VM process and computes CPU / memory numbers.
-//!   It knows nothing about the UI.
+//! * [`monitor`] finds the WSL2 VM process, computes CPU / memory numbers, and
+//!   runs the `wsl.exe` commands (start/shutdown). It knows nothing about the
+//!   UI.
+//! * [`config`] loads the optional `wsl-tray.ini` settings file.
 //! * [`icon`] turns a [`icon::Level`] (off / ok / warn / high) into an `HICON`
 //!   from the embedded Tux mask, and has the PNG writer used by `-render-test`.
-//! * this file: command line, window, tray icon, menu, registry (autostart and
-//!   the Windows 11 "show next to the clock" flag), diagnostics log.
+//! * this file: command line, window, tray icon, menu, registry (the
+//!   `autostart` Run key and the Windows 11 "show next to the clock" flag),
+//!   diagnostics log.
+//!
+//! # WSL2 lifecycle
+//!
+//! This app does not keep any process of its own running to hold WSL2 up:
+//! once the VM boots, `.wslconfig`'s own `vmIdleTimeout` (see the README) is
+//! what keeps it from idling out, if the user has set that. **Start** just
+//! runs `wsl.exe [--distribution <name>] -- exit` ([`monitor::start_wsl`]) to
+//! boot the VM (and that distribution) and waits for the trivial `exit`
+//! command to return, exactly as typing `wsl -- exit` into Win+R would; the
+//! process does not outlive the command. **Shutdown** runs `wsl --shutdown`
+//! (confirmed with a dialog, since it affects every distribution) and
+//! **Restart** is Shutdown followed by Start. All three run on a helper
+//! thread and report back with `WM_REFRESH_NOW`; [`App::busy`] tracks which
+//! one is in flight (`Starting` / `Restarting` / `ShuttingDown`), shown as
+//! the tooltip status line and used to grey out the other menu commands
+//! meanwhile. Exit does not shut WSL2 down: it is expected to keep running
+//! (or not) exactly as `.wslconfig` and the user's own use of `wsl.exe`
+//! elsewhere dictate.
 //!
 //! # Threading
 //!
-//! Everything runs on the main thread, which is also the UI thread. The one
-//! exception is the thread that waits for `wsl --shutdown`; it talks back only
-//! through `PostMessageW(WM_REFRESH_NOW)`, which is thread-safe.
+//! Everything runs on the main thread, which is also the UI thread. The only
+//! exceptions are the helper threads spawned by Start/Restart/Shutdown to run
+//! the blocking `wsl.exe` commands; they talk back only through
+//! `PostMessageW`, which is thread-safe.
 //!
 //! # Re-entrancy
 //!
@@ -45,12 +72,14 @@
 //! while the first one, or a dialog it launched, is still up.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod config;
 mod icon;
 mod monitor;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fs::File;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -66,8 +95,9 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NINF_KEY, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NINF_KEY, NIN_SELECT, NOTIFYICONDATAW,
+    NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
@@ -75,13 +105,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenuEx, TranslateMessage,
     CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
+    MB_ICONQUESTION, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
     WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
 };
 
+use config::Config;
 use icon::Level;
-use monitor::{format_bytes, shutdown_wsl, Monitor, Status};
+use monitor::{format_bytes, quote_arg, shutdown_wsl, start_wsl, Monitor, Status};
 
 /// Private message the shell sends to our window for tray-icon events
 /// (`NOTIFYICONDATAW::uCallbackMessage`). With `NOTIFYICON_VERSION_4` the
@@ -90,21 +121,22 @@ const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
 /// Keyboard activation of the icon (Enter/Space). `windows-sys` exports
 /// `NIN_SELECT` and `NINF_KEY` but not their combination.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
-/// Posted by the shutdown thread once `wsl --shutdown` has returned, so the
-/// UI thread re-polls immediately instead of waiting for the next timer tick.
+/// Posted by the Start/Restart/Shutdown thread once its `wsl.exe` command(s)
+/// have returned, so the UI thread re-polls immediately instead of waiting
+/// for the next timer tick.
 const WM_REFRESH_NOW: u32 = WM_APP + 2;
 
 /// `SetTimer` id of the poll timer.
 const TIMER_POLL: usize = 1;
 
-// Menu command ids returned by TrackPopupMenuEx(TPM_RETURNCMD). Status lines
-// are disabled items and are never returned, but still need distinct ids.
-const IDM_STATUS: usize = 1;
-const IDM_STATS: usize = 2;
+// Menu command ids returned by TrackPopupMenuEx(TPM_RETURNCMD).
+const IDM_START: usize = 1;
+const IDM_RESTART: usize = 2;
 const IDM_SHUTDOWN: usize = 3;
-const IDM_REFRESH: usize = 4;
-const IDM_AUTOSTART: usize = 5;
-const IDM_EXIT: usize = 6;
+const IDM_EXPLORER: usize = 4;
+const IDM_TERMINAL: usize = 5;
+const IDM_REFRESH: usize = 6;
+const IDM_EXIT: usize = 7;
 
 /// Window class of the hidden window. Also handy for finding the window from
 /// outside (`FindWindowW`) when automating tests.
@@ -138,6 +170,8 @@ struct Options {
     process: String,
     /// Diagnostics log file (`-log`), appended to.
     log: Option<String>,
+    /// Config file (`-config`); defaults to `wsl-tray.ini` next to the exe.
+    config: Option<String>,
     /// Directory for the icon PNG dump (`-render-test`); exits afterwards.
     render_test: Option<String>,
 }
@@ -155,12 +189,13 @@ const DEFAULT_PROCESS: &str = if cfg!(feature = "win10") {
 /// because the `--process` default is chosen per build.
 fn usage() -> String {
     format!(
-        "wsl-tray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--render-test DIR]
+        "wsl-tray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--config FILE] [--render-test DIR]
 
   --poll         how often to check whether WSL2 is running (cheap)
   --interval     how often to refresh CPU/memory while WSL2 is running
   --process      name of the WSL2 VM process
   --log          append diagnostic log lines to this file
+  --config       config file to read (default: wsl-tray.ini next to the exe)
   --render-test  write sample icon PNGs to this directory and exit"
     )
 }
@@ -214,6 +249,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         stats: Duration::from_secs(30),
         process: DEFAULT_PROCESS.into(),
         log: None,
+        config: None,
         render_test: None,
     };
     let mut it = std::env::args().skip(1);
@@ -240,6 +276,7 @@ fn parse_args() -> Result<Option<Options>, String> {
             "interval" => o.stats = parse_duration(&value()?).ok_or("bad --interval duration")?,
             "process" => o.process = value()?,
             "log" => o.log = Some(value()?),
+            "config" => o.config = Some(value()?),
             "render-test" => o.render_test = Some(value()?),
             "h" | "help" => return Ok(None),
             _ => return Err(format!("unknown flag: {a}\n\n{}", usage())),
@@ -291,10 +328,34 @@ fn local_time() -> SYSTEMTIME {
 /// etc.). Blocks and pumps messages until dismissed, see the re-entrancy note
 /// in the module docs.
 fn message_box(hwnd: HWND, text: &str, flags: u32) -> i32 {
-    unsafe { MessageBoxW(hwnd, wide(text).as_ptr(), wide(APP_TITLE).as_ptr(), flags) }
+    message_box_titled(hwnd, APP_TITLE, text, flags)
+}
+
+/// `MessageBoxW` with a caller-chosen title, for dialogs (such as the
+/// Shutdown confirmation) that name the specific action rather than the app.
+fn message_box_titled(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
+    unsafe { MessageBoxW(hwnd, wide(text).as_ptr(), wide(title).as_ptr(), flags) }
 }
 
 // ---- application state ----
+
+/// What Start/Restart/Shutdown is doing right now, if anything. Shown as the
+/// tooltip status line, and used to grey out the menu commands while one is
+/// in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    /// No command in flight; the status line follows [`Status::running`].
+    Idle,
+    /// `Start`'s `wsl.exe ... -- exit` is running on a helper thread; cleared
+    /// when it posts `WM_REFRESH_NOW`.
+    Starting,
+    /// `Restart`'s shutdown-then-start is running on a helper thread;
+    /// cleared when it posts `WM_REFRESH_NOW`.
+    Restarting,
+    /// `Shutdown`'s `wsl --shutdown` is running on a helper thread; cleared
+    /// when it posts `WM_REFRESH_NOW`.
+    ShuttingDown,
+}
 
 /// All mutable state of the program. There is exactly one instance, stored in
 /// the [`APP`] thread-local of the UI thread and reached through
@@ -318,9 +379,9 @@ struct App {
     /// Icon edge length in pixels: `SM_CXSMICON` at the current DPI
     /// (16 at 100 %, 20 at 125 %, 24 at 150 %, ...).
     icon_size: usize,
-    /// True between the user confirming "Shut down WSL2" and the shutdown
-    /// thread posting `WM_REFRESH_NOW`. Greys out the menu item meanwhile.
-    shutting_down: Cell<bool>,
+    /// What Start/Restart/Shutdown is doing right now; see [`Busy`]. Blocks a
+    /// second one of these from starting while one is already in flight.
+    busy: Cell<Busy>,
     /// Re-entrancy guard for [`App::show_menu`]; held until the chosen
     /// command (including any dialog it shows) has finished.
     menu_open: Cell<bool>,
@@ -341,6 +402,8 @@ struct App {
     /// Arguments this instance was started with, replayed into the autostart
     /// Run value so an autostarted copy behaves the same.
     launch_args: Vec<String>,
+    /// Settings loaded from the config file; see [`config`].
+    config: Config,
 }
 
 thread_local! {
@@ -387,6 +450,13 @@ fn main() {
         }
     }
 
+    let config_path = opts
+        .config
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(config::default_path);
+    let config = Config::load(&config_path);
+
     // Single instance per session: a named mutex in the Local\ namespace. If
     // it already exists another copy is running and this one exits quietly.
     // The handle is intentionally leaked; the OS releases it with the process.
@@ -417,7 +487,7 @@ fn main() {
         hicon: Cell::new(null_mut()),
         mon: RefCell::new(Monitor::new(&opts.process, opts.stats)),
         icon_size,
-        shutting_down: Cell::new(false),
+        busy: Cell::new(Busy::Idle),
         menu_open: Cell::new(false),
         taskbar_created: Cell::new(0),
         last_level: Cell::new(None),
@@ -425,6 +495,7 @@ fn main() {
         promote_tries: Cell::new(0),
         exe_path,
         launch_args: std::env::args().skip(1).collect(),
+        config,
     };
     APP.with(|slot| {
         if slot.set(app).is_err() {
@@ -440,6 +511,10 @@ fn main() {
         a.tick(true);
         a.add_tray_icon();
         a.promote_once();
+        a.sync_app_autostart();
+        if a.config.autoboot {
+            a.start();
+        }
         unsafe { SetTimer(a.hwnd.get(), TIMER_POLL, opts.poll.as_millis() as u32, None) };
     });
 
@@ -534,9 +609,9 @@ impl App {
                 Some(0)
             }
             WM_REFRESH_NOW => {
-                // The shutdown thread is done; re-enable the menu item and
-                // show the new state right away.
-                self.shutting_down.set(false);
+                // The Start/Restart/Shutdown thread is done; re-enable the
+                // menu items and show the new state right away.
+                self.busy.set(Busy::Idle);
                 self.tick(true);
                 Some(0)
             }
@@ -545,7 +620,10 @@ impl App {
                 Some(0)
             }
             WM_DESTROY => {
-                // Tear down in reverse order of creation, then end the loop.
+                // WSL2 itself is left exactly as it is: this app keeps no
+                // process of its own running to hold it up, see the module
+                // docs. Tear down in reverse order of creation, then end the
+                // loop.
                 unsafe {
                     KillTimer(hwnd, TIMER_POLL);
                     Shell_NotifyIconW(NIM_DELETE, &*self.nid.borrow());
@@ -602,10 +680,19 @@ impl App {
             }
         }
         let mut nid = self.nid.borrow_mut();
-        set_tip(&mut nid, &tooltip(st));
+        set_tip(&mut nid, &tooltip(st, self.busy.get()));
         nid.hIcon = self.hicon.get();
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &*nid) };
+    }
+
+    /// Redraws the tooltip (and, if needed, the icon) right away. Used after
+    /// changing [`App::busy`] outside of [`App::tick`], since a `busy`
+    /// transition is not itself a change in [`Status`] and would otherwise
+    /// wait for the next one to show up.
+    fn refresh_display(&self) {
+        let st = self.mon.borrow().current();
+        self.update_icon(&st);
     }
 
     /// Adds the icon to the notification area and switches it to
@@ -623,7 +710,7 @@ impl App {
         nid.uCallbackMessage = WM_TRAY_CALLBACK;
         nid.hIcon = self.hicon.get();
         let st = self.mon.borrow().current();
-        set_tip(&mut nid, &tooltip(&st));
+        set_tip(&mut nid, &tooltip(&st, self.busy.get()));
         unsafe {
             Shell_NotifyIconW(NIM_ADD, &*nid);
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -633,9 +720,11 @@ impl App {
 
     /// Builds and shows the popup menu at the cursor, then runs the chosen
     /// command. Used for left click, right click and keyboard activation.
+    /// Status (Running/Stopped, CPU, RAM) is shown in the tooltip only; see
+    /// [`tooltip`].
     ///
-    /// The menu is rebuilt on every click because its contents (the stats
-    /// line, the enabled/checked states) depend on the current status.
+    /// The menu is rebuilt on every click because its contents (the enabled
+    /// states) depend on the current state.
     fn show_menu(&self) {
         // TrackPopupMenuEx pumps messages, so a second tray click would land
         // here again while the first menu is still open.
@@ -643,6 +732,7 @@ impl App {
             return;
         }
         let st = self.mon.borrow().current();
+        let busy = self.busy.get();
         let cmd = unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
@@ -652,24 +742,25 @@ impl App {
             let add = |flags: u32, id: usize, text: &str| {
                 AppendMenuW(menu, flags, id, wide(text).as_ptr());
             };
-            if st.running {
-                add(MF_STRING | MF_GRAYED, IDM_STATUS, "WSL2 is running");
-                add(MF_STRING | MF_GRAYED, IDM_STATS, &stats_line(&st));
-            } else {
-                add(MF_STRING | MF_GRAYED, IDM_STATUS, "WSL2 is stopped");
-            }
+            // Enabled only when `available` (e.g. Start needs WSL2 stopped)
+            // and no other command is already in flight. Explorer and
+            // Terminal reuse it too: both need a running, idle session.
+            let action = |available: bool| {
+                MF_STRING
+                    | if available && busy == Busy::Idle {
+                        0
+                    } else {
+                        MF_GRAYED
+                    }
+            };
+
+            add(action(!st.running), IDM_START, "&Start");
+            add(action(st.running), IDM_RESTART, "&Restart");
+            add(action(st.running), IDM_SHUTDOWN, "S&hutdown");
             add(MF_SEPARATOR, 0, "");
-            if self.shutting_down.get() {
-                add(MF_STRING | MF_GRAYED, IDM_SHUTDOWN, "Shutting down...");
-            } else if st.running {
-                add(MF_STRING, IDM_SHUTDOWN, "&Shut down WSL2");
-            } else {
-                add(MF_STRING | MF_GRAYED, IDM_SHUTDOWN, "&Shut down WSL2");
-            }
-            add(MF_STRING, IDM_REFRESH, "&Refresh now");
-            add(MF_SEPARATOR, 0, "");
-            let auto = MF_STRING | if autostart_enabled() { MF_CHECKED } else { 0 };
-            add(auto, IDM_AUTOSTART, "Start with &Windows");
+            add(action(st.running), IDM_EXPLORER, "&Explorer");
+            add(action(st.running), IDM_TERMINAL, "Ter&minal");
+            add(MF_STRING, IDM_REFRESH, "Re&fresh");
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, IDM_EXIT, "E&xit");
 
@@ -698,13 +789,12 @@ impl App {
 
         log!("menu command {cmd}");
         match cmd {
+            IDM_START => self.start(),
+            IDM_RESTART => self.restart(),
             IDM_SHUTDOWN => self.shutdown(),
+            IDM_EXPLORER => self.open_explorer(),
+            IDM_TERMINAL => self.open_terminal(),
             IDM_REFRESH => self.tick(true),
-            IDM_AUTOSTART => {
-                if let Err(e) = self.set_autostart(!autostart_enabled()) {
-                    message_box(self.hwnd.get(), &e, MB_ICONERROR);
-                }
-            }
             IDM_EXIT => unsafe {
                 DestroyWindow(self.hwnd.get());
             },
@@ -715,22 +805,45 @@ impl App {
         self.menu_open.set(false);
     }
 
-    /// "Shut down WSL2": asks for confirmation (default button is No), then
-    /// runs `wsl --shutdown` on a helper thread so the UI keeps responding.
-    /// The thread reports back with `WM_REFRESH_NOW`.
-    fn shutdown(&self) {
-        if self.shutting_down.get() {
+    /// "Start": boots the configured distribution (or WSL's own default) by
+    /// running `wsl.exe ... -- exit` on a helper thread, exactly as typing
+    /// that into Win+R would, and returns as soon as it exits. A no-op while
+    /// WSL2 is already running or another command is in flight. The thread
+    /// reports back with `WM_REFRESH_NOW`.
+    fn start(&self) {
+        if self.busy.get() != Busy::Idle || self.mon.borrow().current().running {
             return;
         }
-        let r = message_box(
+        self.busy.set(Busy::Starting);
+        self.refresh_display();
+        let hwnd = self.hwnd.get() as isize;
+        let distro = self.config.distroname.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = start_wsl(&distro) {
+                message_box(null_mut(), &e, MB_ICONERROR);
+            }
+            unsafe { PostMessageW(hwnd as HWND, WM_REFRESH_NOW, 0, 0) };
+        });
+    }
+
+    /// "Shutdown": asks for confirmation (default button is No), then runs
+    /// `wsl --shutdown` on a helper thread so the UI keeps responding. The
+    /// thread reports back with `WM_REFRESH_NOW`.
+    fn shutdown(&self) {
+        if self.busy.get() != Busy::Idle {
+            return;
+        }
+        let r = message_box_titled(
             self.hwnd.get(),
-            "Shut down WSL2?\n\nAll running distributions will be terminated.",
+            "Shutdown WSL",
+            "Confirm shutting down WSL?\n\nAll running distributions will be terminated.",
             MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
         );
         if r != IDYES {
             return;
         }
-        self.shutting_down.set(true);
+        self.busy.set(Busy::ShuttingDown);
+        self.refresh_display();
         // HWND is a raw pointer and therefore not Send; carry it as an integer.
         // The thread only ever hands it to PostMessageW, which is thread-safe.
         let hwnd = self.hwnd.get() as isize;
@@ -740,6 +853,69 @@ impl App {
             }
             unsafe { PostMessageW(hwnd as HWND, WM_REFRESH_NOW, 0, 0) };
         });
+    }
+
+    /// "Restart": shuts WSL2 down (`wsl --shutdown`) and boots it again
+    /// (`wsl.exe ... -- exit`), both on the same helper thread so the two
+    /// steps run in order. Never prompts: choosing Restart from the menu is
+    /// itself an explicit, deliberate action. The thread reports back with
+    /// `WM_REFRESH_NOW`.
+    fn restart(&self) {
+        if self.busy.get() != Busy::Idle {
+            return;
+        }
+        self.busy.set(Busy::Restarting);
+        self.refresh_display();
+        let hwnd = self.hwnd.get() as isize;
+        let distro = self.config.distroname.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = shutdown_wsl() {
+                message_box(null_mut(), &e, MB_ICONERROR);
+            }
+            if let Err(e) = start_wsl(&distro) {
+                message_box(null_mut(), &e, MB_ICONERROR);
+            }
+            unsafe { PostMessageW(hwnd as HWND, WM_REFRESH_NOW, 0, 0) };
+        });
+    }
+
+    /// "Explorer": opens `\\wsl.localhost\<distro>`, or `\\wsl.localhost`
+    /// (letting Explorer list every distribution) when none is configured.
+    /// Only reachable from the menu while WSL2 is running and idle; see
+    /// [`App::show_menu`].
+    fn open_explorer(&self) {
+        let target = if self.config.distroname.is_empty() {
+            r"\\wsl.localhost".to_string()
+        } else {
+            format!(r"\\wsl.localhost\{}", self.config.distroname)
+        };
+        shell_open(self.hwnd.get(), &target, "");
+    }
+
+    /// "Terminal": with `wtprofile` configured, opens that Windows Terminal
+    /// profile directly (`wt.exe --profile <name>`); WSL profiles already
+    /// default to the Linux user's home directory, so nothing else is
+    /// needed. Otherwise opens the system's default terminal running
+    /// `wsl --distribution <distro>` (or plain `wsl` with no distribution
+    /// configured), exactly as typing that into Win+R would, except that
+    /// `--cd ~` is always added so the session starts in the Linux user's
+    /// home directory rather than wherever this app's own working directory
+    /// happens to map to. Only reachable from the menu while WSL2 is running
+    /// and idle; see [`App::show_menu`].
+    fn open_terminal(&self) {
+        if !self.config.wtprofile.is_empty() {
+            let params = format!("--profile {}", quote_arg(&self.config.wtprofile));
+            shell_open(self.hwnd.get(), "wt.exe", &params);
+            return;
+        }
+        let mut params = String::from("--cd ~");
+        if !self.config.distroname.is_empty() {
+            params = format!(
+                "--distribution {} {params}",
+                quote_arg(&self.config.distroname)
+            );
+        }
+        shell_open(self.hwnd.get(), "wsl.exe", &params);
     }
 
     // ---- Windows 11 tray promotion ----
@@ -760,9 +936,19 @@ impl App {
 
     // ---- autostart (HKCU\...\Run) ----
 
+    /// Applies `autostart` from the config file to the `Run` key, every
+    /// launch. There is no menu toggle for this any more: the config file is
+    /// the only place it is set, so the registry is kept in sync with it
+    /// unconditionally rather than only on a user-initiated change.
+    fn sync_app_autostart(&self) {
+        if let Err(e) = self.set_autostart(self.config.autostart) {
+            log!("autostart sync failed: {e}");
+        }
+    }
+
     /// Writes or deletes the `Run` value. The value is the quoted launch path
-    /// followed by this instance's own arguments, so `-poll`/`-log` settings
-    /// survive into the autostarted copy.
+    /// followed by this instance's own arguments, so `-poll`/`-log`/`-config`
+    /// settings survive into the autostarted copy.
     fn set_autostart(&self, enable: bool) -> Result<(), String> {
         let key = RegKey::open(HKEY_CURRENT_USER, RUN_KEY, KEY_READ | KEY_WRITE)?;
         if !enable {
@@ -791,30 +977,73 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// Tooltip text: state, the stats line, and when it was last sampled.
-fn tooltip(st: &Status) -> String {
-    if !st.running {
-        return "WSL2: stopped".into();
+/// Status line shared by the tooltip and the menu: a transitional label
+/// while Start/Restart/Shutdown is in flight, otherwise `Running`/`Stopped`.
+fn status_text(running: bool, busy: Busy) -> &'static str {
+    match busy {
+        Busy::Starting => "Starting...",
+        Busy::Restarting => "Restarting...",
+        Busy::ShuttingDown => "Shutting down...",
+        Busy::Idle if running => "Running",
+        Busy::Idle => "Stopped",
     }
-    let mut s = format!("WSL2: running\n{}", stats_line(st));
-    if let Some((h, m, sec)) = st.updated {
-        s.push_str(&format!("\nupdated {h:02}:{m:02}:{sec:02}"));
-    }
-    s
 }
 
-/// `CPU 12.4 %   MEM 5.40 GB (11.2 %)`; CPU shows `...` until the second
-/// sample after the VM appeared.
-fn stats_line(st: &Status) -> String {
-    let cpu = match st.cpu {
-        Some(c) => format!("{c:.1} %"),
-        None => "...".into(),
+/// Tooltip text: the status line, and CPU/RAM only while idle and running
+/// (a transitional label, or `Stopped`, never has numbers to go with it).
+fn tooltip(st: &Status, busy: Busy) -> String {
+    let label = status_text(st.running, busy);
+    if busy != Busy::Idle || !st.running {
+        return label.into();
+    }
+    format!("{label}\n{}\n{}", cpu_label(st), ram_label(st))
+}
+
+/// `CPU: 12.4%`; shows `CPU: ...` until the second sample after the VM
+/// appeared.
+fn cpu_label(st: &Status) -> String {
+    match st.cpu {
+        Some(c) => format!("CPU: {c:.1}%"),
+        None => "CPU: ...".into(),
+    }
+}
+
+/// `RAM: 5.00 GB` (or `RAM: 768 MB` below 1 GiB).
+fn ram_label(st: &Status) -> String {
+    format!("RAM: {}", format_bytes(st.mem))
+}
+
+/// `ShellExecuteW("open", file, params)`, used by the Explorer and Terminal
+/// menu commands. Errors are shown in a message box; there is no result the
+/// caller needs afterwards.
+fn shell_open(hwnd: HWND, file: &str, params: &str) {
+    // Win32 SW_SHOWNORMAL; not imported from windows-sys because ShellExecuteW
+    // takes a plain i32 here, not the SHOW_WINDOW_CMD type ShowWindow uses.
+    const SW_SHOWNORMAL: i32 = 1;
+    let file_w = wide(file);
+    let params_w = wide(params);
+    let result = unsafe {
+        ShellExecuteW(
+            hwnd,
+            wide("open").as_ptr(),
+            file_w.as_ptr(),
+            if params.is_empty() {
+                null()
+            } else {
+                params_w.as_ptr()
+            },
+            null(),
+            SW_SHOWNORMAL,
+        )
     };
-    format!(
-        "CPU {cpu}   MEM {} ({:.1} %)",
-        format_bytes(st.mem),
-        st.mem_pct
-    )
+    // ShellExecuteW returns a pseudo-HINSTANCE: a value above 32 means success.
+    if (result as isize) <= 32 {
+        message_box(
+            hwnd,
+            &format!("Could not open {file}: error code {}", result as isize),
+            MB_ICONERROR,
+        );
+    }
 }
 
 /// Copies `s` into `szTip` (128 UTF-16 units including the terminator),
@@ -885,22 +1114,6 @@ impl RegKey {
         (r == 0 && typ == REG_DWORD).then_some(v)
     }
 
-    /// True if the value exists, whatever its type (a size-only query).
-    fn value_exists(&self, name: &str) -> bool {
-        let mut typ = 0u32;
-        let mut len = 0u32;
-        unsafe {
-            RegQueryValueExW(
-                self.0,
-                wide(name).as_ptr(),
-                null_mut(),
-                &mut typ,
-                null_mut(),
-                &mut len,
-            ) == 0
-        }
-    }
-
     /// Writes a `REG_SZ` value. Fails with the Win32 error code.
     fn set_string(&self, name: &str, value: &str) -> Result<(), u32> {
         let u = wide(value);
@@ -959,13 +1172,6 @@ impl Drop for RegKey {
     fn drop(&mut self) {
         unsafe { RegCloseKey(self.0) };
     }
-}
-
-/// Whether the "Start with Windows" Run value currently exists.
-fn autostart_enabled() -> bool {
-    RegKey::open(HKEY_CURRENT_USER, RUN_KEY, KEY_READ)
-        .map(|k| k.value_exists(RUN_VALUE))
-        .unwrap_or(false)
 }
 
 /// Maps the extended-length syntax returned by `canonicalize` back to the
@@ -1106,11 +1312,28 @@ mod tests {
             mem_pct: 8.44,
             ..Default::default()
         };
-        assert_eq!(stats_line(&st), "CPU 12.4 %   MEM 5.00 GB (8.4 %)");
+        assert_eq!(cpu_label(&st), "CPU: 12.4%");
+        assert_eq!(ram_label(&st), "RAM: 5.00 GB");
+        assert_eq!(cpu_label(&Status { cpu: None, ..st }), "CPU: ...");
         assert_eq!(
-            stats_line(&Status { cpu: None, ..st }),
-            "CPU ...   MEM 5.00 GB (8.4 %)"
+            tooltip(&st, Busy::Idle),
+            "Running\nCPU: 12.4%\nRAM: 5.00 GB"
         );
-        assert_eq!(tooltip(&Status::default()), "WSL2: stopped");
+        assert_eq!(tooltip(&Status::default(), Busy::Idle), "Stopped");
+    }
+
+    #[test]
+    fn tooltip_hides_stats_while_busy() {
+        let st = Status {
+            running: true,
+            cpu: Some(12.44),
+            mem: 5 << 30,
+            ..Default::default()
+        };
+        assert_eq!(tooltip(&st, Busy::Starting), "Starting...");
+        assert_eq!(tooltip(&st, Busy::Restarting), "Restarting...");
+        assert_eq!(tooltip(&st, Busy::ShuttingDown), "Shutting down...");
+        assert_eq!(status_text(false, Busy::Idle), "Stopped");
+        assert_eq!(status_text(true, Busy::Idle), "Running");
     }
 }
