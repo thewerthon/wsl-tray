@@ -1,25 +1,19 @@
-# wsl-tray
+# wsltray
 
-[![build](https://github.com/ideaconnect/wsl-tray/actions/workflows/build.yml/badge.svg)](https://github.com/ideaconnect/wsl-tray/actions/workflows/build.yml)
-[![release](https://img.shields.io/github/v/release/ideaconnect/wsl-tray)](https://github.com/ideaconnect/wsl-tray/releases)
-[![Made in the EU](https://raw.githubusercontent.com/ideaconnect/made-in-the-eu/main/software-badge/made-in-the-eu.svg)](https://github.com/ideaconnect/made-in-the-eu)
+[![build](https://github.com/thewerthon/wsltray/actions/workflows/build.yml/badge.svg)](https://github.com/thewerthon/wsltray/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/thewerthon/wsltray)](https://github.com/thewerthon/wsltray/releases)
 
 Windows tray icon that shows whether the WSL2 VM is running and how much CPU
 and memory it uses, with menu commands to start, restart and shut it down.
 
 ![Tray icon while WSL2 is running](docs/tray-running.png)
 
-It sits next to the clock like the keyboard-layout badge. Grey means the WSL2
-VM is off; green, orange or red means it is running and shows how much of the
-machine it is using.
-
-![Icon states](docs/states.png)
-
-Left to right: off, running below 50 %, 50–75 %, above 75 %.
+It sits next to the clock like the keyboard-layout badge, coloured while the
+WSL2 VM is running and monochrome while it is off; see the `icon` key in
+[Configuration](#configuration) to pin it to one or the other instead.
 
 Percentages are relative to the whole machine (all logical cores, all physical
-RAM), the same way Task Manager reports `vmmemWSL`. The colour follows whichever
-of CPU or memory is higher.
+RAM), the same way Task Manager reports `vmmemWSL`.
 
 Hover for the numbers:
 
@@ -42,7 +36,6 @@ Shutdown               (asks for confirmation)
 ---
 Explorer               (\\wsl.localhost\<distro>)
 Terminal               (wsl --distribution <distro>)
-Refresh
 ---
 Exit
 ```
@@ -55,11 +48,11 @@ running. Whether the VM then stays up is entirely up to `.wslconfig`'s own
 — set it to `-1` if you want WSL2 to stay running indefinitely once started;
 see [Configuration](#configuration). **Shutdown** runs `wsl --shutdown`
 (every distribution, with a confirmation prompt) and **Restart** is Shutdown
-followed by Start. **Exit** only closes wsl-tray; it never shuts WSL2 down.
+followed by Start. **Exit** only closes wsltray; it never shuts WSL2 down.
 **Explorer** and **Terminal** are only enabled while WSL2 is running and idle;
 they open the configured distribution directly, or WSL's own default when
 none is configured. **Terminal** always starts in the Linux user's home
-directory (`--cd ~`), regardless of wsl-tray's own working directory — unless
+directory (`--cd ~`), regardless of wsltray's own working directory — unless
 `wtprofile` is configured, in which case it opens that Windows Terminal
 profile instead, which already defaults to the Linux home directory on its
 own.
@@ -67,20 +60,20 @@ own.
 ## Download
 
 <p align="center">
-  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win11-x64.exe"><img src="https://img.shields.io/badge/Windows_11-AMD64-0078D4?style=for-the-badge" alt="Download for Windows 11, AMD64"></a>
+  <a href="https://github.com/thewerthon/wsltray/releases/latest/download/wsltray-win11-x64.exe"><img src="https://img.shields.io/badge/Windows_11-AMD64-0078D4?style=for-the-badge" alt="Download for Windows 11, AMD64"></a>
   &nbsp;&nbsp;
-  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win11-arm64.exe"><img src="https://img.shields.io/badge/Windows_11-ARM64-0078D4?style=for-the-badge" alt="Download for Windows 11, ARM64"></a>
+  <a href="https://github.com/thewerthon/wsltray/releases/latest/download/wsltray-win11-arm64.exe"><img src="https://img.shields.io/badge/Windows_11-ARM64-0078D4?style=for-the-badge" alt="Download for Windows 11, ARM64"></a>
 </p>
 <p align="center">
-  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win10-x64.exe"><img src="https://img.shields.io/badge/Windows_10-AMD64-0078D4?style=for-the-badge" alt="Download for Windows 10, AMD64"></a>
+  <a href="https://github.com/thewerthon/wsltray/releases/latest/download/wsltray-win10-x64.exe"><img src="https://img.shields.io/badge/Windows_10-AMD64-0078D4?style=for-the-badge" alt="Download for Windows 10, AMD64"></a>
   &nbsp;&nbsp;
-  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win10-arm64.exe"><img src="https://img.shields.io/badge/Windows_10-ARM64-0078D4?style=for-the-badge" alt="Download for Windows 10, ARM64"></a>
+  <a href="https://github.com/thewerthon/wsltray/releases/latest/download/wsltray-win10-arm64.exe"><img src="https://img.shields.io/badge/Windows_10-ARM64-0078D4?style=for-the-badge" alt="Download for Windows 10, ARM64"></a>
 </p>
 
 The buttons always fetch the latest release. Each
-[release](https://github.com/ideaconnect/wsl-tray/releases) has four
-executables attached, `wsl-tray-win11-x64.exe`, `wsl-tray-win11-arm64.exe`,
-`wsl-tray-win10-x64.exe` and `wsl-tray-win10-arm64.exe`, with a `SHA256SUMS`
+[release](https://github.com/thewerthon/wsltray/releases) has four
+executables attached, `wsltray-win11-x64.exe`, `wsltray-win11-arm64.exe`,
+`wsltray-win10-x64.exe` and `wsltray-win10-arm64.exe`, with a `SHA256SUMS`
 file. There is nothing to install: put the file somewhere permanent, run it,
 and tick **Start with Windows** in the menu if you want it back after a
 reboot. It does not need administrator rights.
@@ -94,44 +87,36 @@ On Windows 11 the icon shows up next to the clock on first run (the app sets
 its own `IsPromoted` flag in `HKCU\Control Panel\NotifyIconSettings`, but only
 if you have not already decided about it in Settings › Taskbar).
 
-## Sponsoring
-
-If wsl-tray is useful to you, you can support its development:
-
-<p align="center">
-  <a href="https://github.com/sponsors/ideaconnect"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
-  &nbsp;&nbsp;
-  <a href="https://buymeacoffee.com/idct"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
-</p>
-
 ## Configuration
 
-wsl-tray reads `wsl-tray.ini` next to the executable, if present (a different
+wsltray reads `wsltray.ini` next to the executable, if present (a different
 path can be given with `-config`). It has no sections, just `key = value`
-lines; `#` and `;` start a comment. Both keys are optional:
+lines; `#` and `;` start a comment. All keys are optional:
 
 ```ini
 autostart = false
 autoboot = false
 distroname = Ubuntu
 wtprofile =
+icon =
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
-| `autostart` | `false` | Start wsl-tray with Windows (writes/deletes the `Run` key on every launch, so this is the only way to change it — there is no menu toggle any more). |
-| `autoboot` | `false` | Run **Start** automatically once, right after wsl-tray launches. |
+| `autostart` | `false` | Start wsltray with Windows (writes/deletes the `Run` key on every launch; this config key is the only way to change it, there is no menu toggle). |
+| `autoboot` | `false` | Run **Start** automatically once, right after wsltray launches. |
 | `distroname` | *(empty)* | Distribution targeted by Start/Restart/Explorer/Terminal. Empty (or omitted) uses whichever distribution WSL picks by default. |
 | `wtprofile` | *(empty)* | Windows Terminal profile name; when set, **Terminal** opens it with `wt.exe --profile <name>` instead of `wsl.exe`. Empty (or omitted) keeps the `wsl.exe` behaviour. |
+| `icon` | *(empty)* | `color` or `mono` pins the tray icon; empty (or anything else) follows WSL2's state: colour while running, mono while stopped. |
 
-wsl-tray itself never keeps WSL2 alive once Start has booted it: that is
-`.wslconfig`'s job (`vmIdleTimeout`), not wsl-tray's. Without it, WSL2 reverts
+wsltray itself never keeps WSL2 alive once Start has booted it: that is
+`.wslconfig`'s job (`vmIdleTimeout`), not wsltray's. Without it, WSL2 reverts
 to its own default idle timeout regardless of `autoboot`.
 
 ## Command line
 
 ```
-wsl-tray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-config FILE] [-render-test DIR]
+wsltray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-config FILE]
 ```
 
 | Flag | Default | Meaning |
@@ -140,8 +125,7 @@ wsl-tray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-config
 | `-interval` | `30s` | How often to refresh CPU and memory while the VM is running. |
 | `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. |
 | `-log` | – | Append one line per poll and menu action to this file. |
-| `-config` | `wsl-tray.ini` next to the exe | Config file to read; see [Configuration](#configuration). |
-| `-render-test` | – | Write the icon in every state and size as PNGs to this directory, then exit. |
+| `-config` | `wsltray.ini` next to the exe | Config file to read; see [Configuration](#configuration). |
 
 Flags can be written as `-poll 10s`, `-poll=10s` or `--poll 10s`. Durations
 are written like `30s`, `1m30s` or `250ms`.
@@ -183,16 +167,17 @@ prints the per-poll cost on your machine.
   normal user. CPU is the difference in kernel+user time between two samples
   divided by wall time and the number of logical cores; memory is the
   process's working set.
-- The icon is the Font Awesome "linux" glyph, rasterized once into a small
-  coverage mask (`assets/tux.bin`, generated by `tools/gentux-rs`) and scaled
-  to the taskbar's icon size at run time. No font is involved, so it looks the
-  same on every machine.
+- The tray icon is one of two embedded `.ico` files (`assets/icon-color.ico`,
+  `assets/icon-mono.ico`), picked by the `icon` config key and whether WSL2 is
+  running. `src/icon.rs` parses the `.ico` container directly and hands the
+  matching image to `CreateIconFromResourceEx`, so no image-decoding crate is
+  needed.
 - `wsl.exe` is always started with `CreateProcessW` and an explicit
   `System32\wsl.exe` path, without a console window, and always run to
   completion with its exit code checked — Start (`-- exit`), Shutdown
   (`--shutdown`) and Restart (both in sequence) all run on a short-lived
   helper thread and never leave a process of their own behind.
-- The config file (`wsl-tray.ini`) is parsed by a small hand-written
+- The config file (`wsltray.ini`) is parsed by a small hand-written
   `key = value` reader (`src/config.rs`) rather than a crate, since it is
   parsed once at startup and the point of the exercise is staying dependency-free.
 
@@ -204,7 +189,7 @@ You need a stable Rust toolchain (1.88 or newer) with the MSVC target.
 .\build.ps1
 ```
 
-This runs `cargo build --release` and copies the result to `.\wsl-tray.exe`.
+This runs `cargo build --release` and copies the result to `.\wsltray.exe`.
 Run that copy rather than the one under `target\`: Windows refuses to
 overwrite a running executable, so running from `target\release` makes the
 next build fail while the tray app is open.
@@ -213,24 +198,16 @@ next build fail while the tray app is open.
 Windows 10 variant. The `win10` feature does nothing but change the default of
 `-process` from `vmmemWSL` to `vmmem`.
 
-The exe icon, the application manifest (per-monitor DPI, common controls v6)
-and the version resource are linked from pre-built objects in `res\` (one per
-architecture), so `rc.exe` is not needed. To regenerate them after editing
-`winres\`:
+The exe icon (`winres/icon-color.ico`), the application manifest (per-monitor
+DPI, common controls v6) and the version resource are linked from pre-built
+objects in `res\` (one per architecture), so `rc.exe` is not needed. To
+regenerate them after editing `winres\`:
 
 ```powershell
 go install github.com/tc-hib/go-winres@latest
-go-winres make --in winres/winres.json --arch amd64,arm64 --out res/wsl-tray
-Move-Item res\wsl-tray_windows_amd64.syso res\wsl-tray-amd64.res.obj -Force
-Move-Item res\wsl-tray_windows_arm64.syso res\wsl-tray-arm64.res.obj -Force
-```
-
-To regenerate the icon mask after changing `tools\gentux-rs\linux.svg` or the
-stroke width:
-
-```powershell
-cd tools\gentux-rs
-cargo run --release
+go-winres make --in winres/winres.json --arch amd64,arm64 --out res/wsltray
+Move-Item res\wsltray_windows_amd64.syso res\wsltray-amd64.res.obj -Force
+Move-Item res\wsltray_windows_arm64.syso res\wsltray-arm64.res.obj -Force
 ```
 
 ### Tests and CI
@@ -246,11 +223,10 @@ pushed.
 ```
 src/main.rs        window, tray icon, menu, autostart, Windows 11 promotion
 src/monitor.rs     process sampling, wsl.exe start/shutdown
-src/config.rs      wsl-tray.ini reader
-src/icon.rs        mask scaling, HICON creation, PNG output for -render-test
-assets/tux.bin     icon mask (generated)
+src/config.rs      wsltray.ini reader
+src/icon.rs        .ico parsing, HICON creation
+assets/            embedded tray icons (icon-color.ico, icon-mono.ico)
 res/               resource objects; winres/ has their sources
-tools/gentux-rs/   mask generator
 docs/              screenshots
 ```
 
@@ -261,6 +237,4 @@ process list is read the way it is in `monitor.rs`, the icon pipeline in
 
 ## License
 
-BSD 3-Clause, see [LICENSE](LICENSE). The Tux glyph is the "linux" icon from
-[Font Awesome Free](https://fontawesome.com), CC BY 4.0; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+BSD 3-Clause, see [LICENSE](LICENSE).

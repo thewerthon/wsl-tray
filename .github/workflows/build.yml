@@ -44,13 +44,13 @@ jobs:
         run: |
           cargo build --locked --release --target ${{ matrix.target }}
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/wsl-tray.exe dist/wsl-tray-win11-${{ matrix.arch }}.exe
+          cp target/${{ matrix.target }}/release/wsltray.exe dist/wsltray-win11-${{ matrix.arch }}.exe
 
       - name: Build (Windows 10)
         shell: bash
         run: |
           cargo build --locked --release --target ${{ matrix.target }} --features win10
-          cp target/${{ matrix.target }}/release/wsl-tray.exe dist/wsl-tray-win10-${{ matrix.arch }}.exe
+          cp target/${{ matrix.target }}/release/wsltray.exe dist/wsltray-win10-${{ matrix.arch }}.exe
 
       - name: Test
         if: matrix.arch == 'x64'
@@ -62,15 +62,6 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --document-private-items --target ${{ matrix.target }}
 
-      - name: Mask generator (fmt, clippy, build, test)
-        if: matrix.arch == 'x64'
-        shell: bash
-        working-directory: tools/gentux-rs
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --release --all-targets -- -D warnings
-          cargo test --locked --release
-
       - name: Report size
         shell: pwsh
         run: |
@@ -78,7 +69,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wsl-tray-${{ matrix.arch }}
+          name: wsltray-${{ matrix.arch }}
           path: dist/*.exe
           if-no-files-found: error
 
@@ -97,8 +88,8 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          sha256sum wsl-tray-win11-x64.exe wsl-tray-win11-arm64.exe \
-                    wsl-tray-win10-x64.exe wsl-tray-win10-arm64.exe > SHA256SUMS
+          sha256sum wsltray-win11-x64.exe wsltray-win11-arm64.exe \
+                    wsltray-win10-x64.exe wsltray-win10-arm64.exe > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish release
@@ -108,17 +99,17 @@ jobs:
           cat > notes.md <<'MD'
           | Download | AMD64 | ARM64 |
           |---|---|---|
-          | Windows 11 (VM process `vmmemWSL`) | `wsl-tray-win11-x64.exe` | `wsl-tray-win11-arm64.exe` |
-          | Windows 10 (VM process `vmmem`) | `wsl-tray-win10-x64.exe` | `wsl-tray-win10-arm64.exe` |
+          | Windows 11 (VM process `vmmemWSL`) | `wsltray-win11-x64.exe` | `wsltray-win11-arm64.exe` |
+          | Windows 10 (VM process `vmmem`) | `wsltray-win10-x64.exe` | `wsltray-win10-arm64.exe` |
 
           The two variants differ only in the default of `-process`. If the icon stays grey while WSL2 is running, check the process name in Task Manager and take the other one.
 
           MD
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "wsl-tray $GITHUB_REF_NAME" \
+            --title "wsltray $GITHUB_REF_NAME" \
             --notes-file notes.md \
             --generate-notes \
-            dist/wsl-tray-win11-x64.exe dist/wsl-tray-win11-arm64.exe \
-            dist/wsl-tray-win10-x64.exe dist/wsl-tray-win10-arm64.exe \
+            dist/wsltray-win11-x64.exe dist/wsltray-win11-arm64.exe \
+            dist/wsltray-win10-x64.exe dist/wsltray-win10-arm64.exe \
             dist/SHA256SUMS

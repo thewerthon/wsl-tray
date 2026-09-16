@@ -7,8 +7,8 @@
 fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let name = match arch.as_str() {
-        "x86_64" => "wsl-tray-amd64.res.obj",
-        "aarch64" => "wsl-tray-arm64.res.obj",
+        "x86_64" => "wsltray-amd64.res.obj",
+        "aarch64" => "wsltray-arm64.res.obj",
         other => {
             println!("cargo:warning=no resource object for target arch {other}; building without icon/manifest");
             return;

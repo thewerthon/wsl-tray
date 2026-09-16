@@ -1,4 +1,4 @@
-//! wsl-tray: a tray indicator for WSL2 (on/off, CPU and memory share of the
+//! wsltray: a tray indicator for WSL2 (on/off, CPU and memory share of the
 //! host, start/restart/shutdown from the menu). Pure Win32 through
 //! `windows-sys`.
 //!
@@ -30,9 +30,9 @@
 //! * [`monitor`] finds the WSL2 VM process, computes CPU / memory numbers, and
 //!   runs the `wsl.exe` commands (start/shutdown). It knows nothing about the
 //!   UI.
-//! * [`config`] loads the optional `wsl-tray.ini` settings file.
-//! * [`icon`] turns a [`icon::Level`] (off / ok / warn / high) into an `HICON`
-//!   from the embedded Tux mask, and has the PNG writer used by `-render-test`.
+//! * [`config`] loads the optional `wsltray.ini` settings file.
+//! * [`icon`] loads one of the two embedded `.ico` files (colour / mono) as
+//!   an `HICON`, picked by the `icon` config key and whether WSL2 is running.
 //! * this file: command line, window, tray icon, menu, registry (the
 //!   `autostart` Run key and the Windows 11 "show next to the clock" flag),
 //!   diagnostics log.
@@ -111,7 +111,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use config::Config;
-use icon::Level;
+use icon::Kind as IconKind;
 use monitor::{format_bytes, quote_arg, shutdown_wsl, start_wsl, Monitor, Status};
 
 /// Private message the shell sends to our window for tray-icon events
@@ -135,8 +135,7 @@ const IDM_RESTART: usize = 2;
 const IDM_SHUTDOWN: usize = 3;
 const IDM_EXPLORER: usize = 4;
 const IDM_TERMINAL: usize = 5;
-const IDM_REFRESH: usize = 6;
-const IDM_EXIT: usize = 7;
+const IDM_EXIT: usize = 6;
 
 /// Window class of the hidden window. Also handy for finding the window from
 /// outside (`FindWindowW`) when automating tests.
@@ -170,10 +169,8 @@ struct Options {
     process: String,
     /// Diagnostics log file (`-log`), appended to.
     log: Option<String>,
-    /// Config file (`-config`); defaults to `wsl-tray.ini` next to the exe.
+    /// Config file (`-config`); defaults to `wsltray.ini` next to the exe.
     config: Option<String>,
-    /// Directory for the icon PNG dump (`-render-test`); exits afterwards.
-    render_test: Option<String>,
 }
 
 /// Default image name of the WSL2 VM process. Windows 11 calls it `vmmemWSL`;
@@ -189,14 +186,13 @@ const DEFAULT_PROCESS: &str = if cfg!(feature = "win10") {
 /// because the `--process` default is chosen per build.
 fn usage() -> String {
     format!(
-        "wsl-tray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--config FILE] [--render-test DIR]
+        "wsltray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--config FILE]
 
   --poll         how often to check whether WSL2 is running (cheap)
   --interval     how often to refresh CPU/memory while WSL2 is running
   --process      name of the WSL2 VM process
   --log          append diagnostic log lines to this file
-  --config       config file to read (default: wsl-tray.ini next to the exe)
-  --render-test  write sample icon PNGs to this directory and exit"
+  --config       config file to read (default: wsltray.ini next to the exe)"
     )
 }
 
@@ -250,7 +246,6 @@ fn parse_args() -> Result<Option<Options>, String> {
         process: DEFAULT_PROCESS.into(),
         log: None,
         config: None,
-        render_test: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -277,7 +272,6 @@ fn parse_args() -> Result<Option<Options>, String> {
             "process" => o.process = value()?,
             "log" => o.log = Some(value()?),
             "config" => o.config = Some(value()?),
-            "render-test" => o.render_test = Some(value()?),
             "h" | "help" => return Ok(None),
             _ => return Err(format!("unknown flag: {a}\n\n{}", usage())),
         }
@@ -388,8 +382,9 @@ struct App {
     /// Id of the registered `"TaskbarCreated"` message, broadcast by a new
     /// Explorer instance; the icon has to be added again then.
     taskbar_created: Cell<u32>,
-    /// Colour level of `hicon`, to skip redundant re-renders.
-    last_level: Cell<Option<Level>>,
+    /// Which of the two embedded icons `hicon` currently shows, to skip
+    /// redundant reloads.
+    last_icon: Cell<Option<IconKind>>,
     /// Windows 11 promotion (see [`promote_tray_icon`]) is done, or not
     /// applicable on this Windows version.
     promoted: Cell<bool>,
@@ -419,9 +414,8 @@ fn with_app<R>(f: impl FnOnce(&App) -> R) -> Option<R> {
     APP.with(|a| a.get().map(f))
 }
 
-/// Entry point: parses flags, handles the `-render-test` and single-instance
-/// early exits, creates the window and icon, then runs the message loop until
-/// `WM_QUIT`.
+/// Entry point: parses flags, handles the single-instance early exit,
+/// creates the window and icon, then runs the message loop until `WM_QUIT`.
 fn main() {
     let opts = match parse_args() {
         Ok(Some(o)) => o,
@@ -434,14 +428,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-
-    if let Some(dir) = &opts.render_test {
-        if let Err(e) = render_test(dir) {
-            message_box(null_mut(), &e, MB_ICONERROR);
-            std::process::exit(1);
-        }
-        return;
-    }
 
     if let Some(path) = &opts.log {
         if let Ok(f) = File::options().create(true).append(true).open(path) {
@@ -490,7 +476,7 @@ fn main() {
         busy: Cell::new(Busy::Idle),
         menu_open: Cell::new(false),
         taskbar_created: Cell::new(0),
-        last_level: Cell::new(None),
+        last_icon: Cell::new(None),
         promoted: Cell::new(false),
         promote_tries: Cell::new(0),
         exe_path,
@@ -662,21 +648,33 @@ impl App {
         self.update_icon(&st);
     }
 
-    /// Pushes `st` to the shell: re-renders the icon if its colour level
-    /// changed, rewrites the tooltip, and calls `NIM_MODIFY`.
+    /// Picks the icon to show for `running`, per the `icon` config key:
+    /// `"color"`/`"mono"` pin it, anything else (including empty) follows
+    /// WSL2's state.
+    fn icon_kind(&self, running: bool) -> IconKind {
+        match self.config.icon.to_ascii_lowercase().as_str() {
+            "color" => IconKind::Color,
+            "mono" => IconKind::Mono,
+            _ if running => IconKind::Color,
+            _ => IconKind::Mono,
+        }
+    }
+
+    /// Pushes `st` to the shell: reloads the icon if which one should be
+    /// shown changed, rewrites the tooltip, and calls `NIM_MODIFY`.
     ///
     /// The previous icon is destroyed only after the new one has been
     /// created; the shell copies the icon during `NIM_MODIFY`, so destroying
     /// the old handle afterwards is safe.
     fn update_icon(&self, st: &Status) {
-        let lv = Level::for_status(st);
-        if self.last_level.get() != Some(lv) || self.hicon.get().is_null() {
-            if let Ok((h, _)) = icon::render_icon(self.icon_size, lv, false) {
+        let kind = self.icon_kind(st.running);
+        if self.last_icon.get() != Some(kind) || self.hicon.get().is_null() {
+            if let Ok(h) = icon::load(kind, self.icon_size) {
                 let old = self.hicon.replace(h);
                 if !old.is_null() {
                     unsafe { DestroyIcon(old) };
                 }
-                self.last_level.set(Some(lv));
+                self.last_icon.set(Some(kind));
             }
         }
         let mut nid = self.nid.borrow_mut();
@@ -760,7 +758,6 @@ impl App {
             add(MF_SEPARATOR, 0, "");
             add(action(st.running), IDM_EXPLORER, "&Explorer");
             add(action(st.running), IDM_TERMINAL, "Ter&minal");
-            add(MF_STRING, IDM_REFRESH, "Re&fresh");
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, IDM_EXIT, "E&xit");
 
@@ -794,7 +791,6 @@ impl App {
             IDM_SHUTDOWN => self.shutdown(),
             IDM_EXPLORER => self.open_explorer(),
             IDM_TERMINAL => self.open_terminal(),
-            IDM_REFRESH => self.tick(true),
             IDM_EXIT => unsafe {
                 DestroyWindow(self.hwnd.get());
             },
@@ -937,9 +933,9 @@ impl App {
     // ---- autostart (HKCU\...\Run) ----
 
     /// Applies `autostart` from the config file to the `Run` key, every
-    /// launch. There is no menu toggle for this any more: the config file is
-    /// the only place it is set, so the registry is kept in sync with it
-    /// unconditionally rather than only on a user-initiated change.
+    /// launch. The config file is the only place this is set (there is no
+    /// menu toggle), so the registry is kept in sync with it unconditionally
+    /// rather than only on a user-initiated change.
     fn sync_app_autostart(&self) {
         if let Err(e) = self.set_autostart(self.config.autostart) {
             log!("autostart sync failed: {e}");
@@ -1226,30 +1222,6 @@ fn promote_tray_icon(exe: &str) -> bool {
     false // not found (yet)
 }
 
-// ---- -render-test: dump icons as PNG for a visual check ----
-
-/// Writes `icon-<size>-<state>.png` for every state at the tray sizes
-/// (16–32 px), 48 px and 256 px. The 256 px files are also the source of the
-/// exe icon in `winres/`.
-fn render_test(dir: &str) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    for sz in [16usize, 20, 24, 32, 48, 256] {
-        for (name, lv) in [
-            ("off", Level::Off),
-            ("ok", Level::Ok),
-            ("warn", Level::Warn),
-            ("high", Level::High),
-        ] {
-            let (hicon, pix) = icon::render_icon(sz, lv, true)?;
-            unsafe { DestroyIcon(hicon) };
-            let png = icon::encode_png(sz, sz, &icon::to_rgba(sz, &pix.unwrap_or_default()));
-            let path = std::path::Path::new(dir).join(format!("icon-{sz}-{name}.png"));
-            std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1279,17 +1251,14 @@ mod tests {
     #[test]
     fn win32_paths() {
         assert_eq!(
-            win32_path(r"\\?\C:\Tools\wsl-tray.exe"),
-            r"C:\Tools\wsl-tray.exe"
+            win32_path(r"\\?\C:\Tools\wsltray.exe"),
+            r"C:\Tools\wsltray.exe"
         );
         assert_eq!(
-            win32_path(r"\\?\UNC\server\share\wsl-tray.exe"),
-            r"\\server\share\wsl-tray.exe"
+            win32_path(r"\\?\UNC\server\share\wsltray.exe"),
+            r"\\server\share\wsltray.exe"
         );
-        assert_eq!(
-            win32_path(r"C:\Tools\wsl-tray.exe"),
-            r"C:\Tools\wsl-tray.exe"
-        );
+        assert_eq!(win32_path(r"C:\Tools\wsltray.exe"), r"C:\Tools\wsltray.exe");
         assert_eq!(win32_path(r"\\?\Volume{1}\x.exe"), r"\\?\Volume{1}\x.exe");
     }
 

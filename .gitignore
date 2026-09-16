@@ -1,4 +1,4 @@
 /target
 /tools/gentux-rs/target
-/wsl-tray.exe
+/wsltray.exe
 *.exe~

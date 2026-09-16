@@ -7,5 +7,5 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $features = if ($Win10) { '--features', 'win10' } else { @() }
 cargo build --release @features
-Copy-Item target\release\wsl-tray.exe .\wsl-tray.exe -Force
-Get-Item .\wsl-tray.exe | Select-Object Name, Length, LastWriteTime
+Copy-Item target\release\wsltray.exe .\wsltray.exe -Force
+Get-Item .\wsltray.exe | Select-Object Name, Length, LastWriteTime
