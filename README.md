@@ -180,6 +180,12 @@ prints the per-poll cost on your machine.
 - The config file (`wsltray.ini`) is parsed by a small hand-written
   `key = value` reader (`src/config.rs`) rather than a crate, since it is
   parsed once at startup and the point of the exercise is staying dependency-free.
+- After every poll, `SetProcessWorkingSetSizeEx` hands back any physical pages
+  the app is not actively using. The process snapshot above is taken into a
+  buffer that grows to fit the largest process count seen (and is not shrunk
+  back), so without this the reported memory would keep reflecting that one-off
+  peak — e.g. after opening Explorer or a terminal — rather than the much
+  smaller working set the app needs between polls.
 
 ## Building
 

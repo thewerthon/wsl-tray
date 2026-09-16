@@ -89,11 +89,12 @@ use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_SZ,
 };
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NINF_KEY, NIN_SELECT, NOTIFYICONDATAW,
@@ -329,6 +330,16 @@ fn message_box(hwnd: HWND, text: &str, flags: u32) -> i32 {
 /// Shutdown confirmation) that name the specific action rather than the app.
 fn message_box_titled(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(hwnd, wide(text).as_ptr(), wide(title).as_ptr(), flags) }
+}
+
+/// Hands back to Windows any physical pages the process is not actively
+/// using. [`Monitor`]'s process-snapshot buffer grows to fit the largest
+/// process count seen and is never shrunk back down, so without this the
+/// reported memory footprint would keep reflecting that one-off peak (e.g.
+/// after opening Explorer or a terminal) rather than the much smaller
+/// working set the app actually needs between polls.
+fn trim_working_set() {
+    unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0) };
 }
 
 // ---- application state ----
@@ -642,10 +653,10 @@ impl App {
             st.cpu.unwrap_or(-1.0),
             format_bytes(st.mem)
         );
-        if !changed && !self.hicon.get().is_null() {
-            return;
+        if changed || self.hicon.get().is_null() {
+            self.update_icon(&st);
         }
-        self.update_icon(&st);
+        trim_working_set();
     }
 
     /// Picks the icon to show for `running`, per the `icon` config key:
