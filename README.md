@@ -99,6 +99,7 @@ autoboot = false
 distroname = Ubuntu
 wtprofile =
 icon =
+refreshms =
 ```
 
 | Key | Default | Meaning |
@@ -108,6 +109,7 @@ icon =
 | `distroname` | *(empty)* | Distribution targeted by Start/Restart/Explorer/Terminal. Empty (or omitted) uses whichever distribution WSL picks by default. |
 | `wtprofile` | *(empty)* | Windows Terminal profile name; when set, **Terminal** opens it with `wt.exe --profile <name>` instead of `wsl.exe`. Empty (or omitted) keeps the `wsl.exe` behaviour. |
 | `icon` | *(empty)* | `color` or `mono` pins the tray icon; empty (or anything else) follows WSL2's state: colour while running, mono while stopped. |
+| `refreshms` | *(empty)* | How often, in milliseconds, to check WSL2's state and refresh the icon/tooltip. Empty (or `0`) keeps the `-poll` default (5000). Overrides `-poll` when set. |
 
 wsltray itself never keeps WSL2 alive once Start has booted it: that is
 `.wslconfig`'s job (`vmIdleTimeout`), not wsltray's. Without it, WSL2 reverts
@@ -116,13 +118,12 @@ to its own default idle timeout regardless of `autoboot`.
 ## Command line
 
 ```
-wsltray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-config FILE]
+wsltray.exe [-poll 5s] [-process vmmemWSL] [-log FILE] [-config FILE]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-poll` | `5s` | How often to check whether the VM process exists. Cheap. |
-| `-interval` | `30s` | How often to refresh CPU and memory while the VM is running. |
+| `-poll` | `5s` | How often to check WSL2's state and refresh the icon/tooltip. Overridden by `refreshms` in the config file, if set. |
 | `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. |
 | `-log` | – | Append one line per poll and menu action to this file. |
 | `-config` | `wsltray.ini` next to the exe | Config file to read; see [Configuration](#configuration). |

@@ -29,8 +29,8 @@
 //! # Cost
 //!
 //! One snapshot copies every process entry (about 700 KB for 250 processes,
-//! ~4 ms). It is taken every `-poll` seconds; the CPU/memory numbers are only
-//! recomputed every `-interval` seconds so the tooltip does not flicker.
+//! ~4 ms) and is taken, together with a CPU/memory refresh, every `-poll`
+//! seconds (`refreshms` in the config file).
 
 use std::ffi::c_void;
 use std::ptr::null;
@@ -69,8 +69,6 @@ pub struct Status {
 pub struct Monitor {
     /// Image name to look for, lower-cased with full Unicode rules.
     proc_name: String,
-    /// Minimum time between CPU/memory refreshes while the VM runs.
-    stats_every: Duration,
     /// Logical cores of the host, the denominator of the CPU percentage.
     ncpu: f64,
     /// Physical RAM in bytes, the denominator of the memory percentage.
@@ -137,7 +135,7 @@ struct SysProcInfo {
 impl Monitor {
     /// Creates a sampler for the process called `proc_name`. Captures the
     /// host's core count and RAM once; both are constant for the session.
-    pub fn new(proc_name: &str, stats_every: Duration) -> Self {
+    pub fn new(proc_name: &str) -> Self {
         let nt_query = unsafe {
             let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
             GetProcAddress(ntdll, c"NtQuerySystemInformation".as_ptr().cast())
@@ -145,7 +143,6 @@ impl Monitor {
         };
         Monitor {
             proc_name: proc_name.chars().flat_map(char::to_lowercase).collect(),
-            stats_every,
             ncpu: num_cpus() as f64,
             total_mem: total_phys_mem() as f64,
             cur: Status::default(),
@@ -170,12 +167,10 @@ impl Monitor {
     /// * VM not found: report stopped (changed only if it was running).
     /// * VM newly found, or a different pid than last time: publish memory
     ///   immediately, remember the CPU time as a baseline, CPU stays `None`.
-    /// * VM known: recompute CPU and memory when `force` is set, when
-    ///   `stats_every` has elapsed since the baseline, or when there is no
-    ///   CPU reading yet (so the first number appears one poll after the VM
-    ///   showed up rather than a full interval later). A window shorter than
-    ///   one second is too noisy and is skipped.
-    pub fn poll(&mut self, force: bool) -> (Status, bool) {
+    /// * VM known: memory is always refreshed; CPU is recomputed too, unless
+    ///   the window since the baseline is shorter than one second, which
+    ///   would give a meaningless rate.
+    pub fn poll(&mut self) -> (Status, bool) {
         let now = Instant::now();
         let found = self.find();
 
@@ -201,13 +196,10 @@ impl Monitor {
             return (self.cur, true);
         }
 
-        // Steady state: refresh every stats_every. Right after a baseline (CPU
-        // still unknown) the next poll is allowed through so a first reading
-        // appears quickly instead of after a full interval.
+        // Steady state: refresh on every call. A window shorter than one
+        // second gives a meaningless CPU rate, so that part is skipped; memory
+        // is cheap and always current.
         let elapsed = now.duration_since(self.last_t);
-        if !force && elapsed < self.stats_every && self.cur.cpu.is_some() {
-            return (self.cur, false);
-        }
         if elapsed >= Duration::from_secs(1) {
             // too short a window gives meaningless numbers
             let delta_ns = (cpu_time - self.last_cpu) as f64 * 100.0; // 100 ns units -> ns
@@ -460,26 +452,21 @@ mod tests {
     #[test]
     fn poll_live() {
         for name in ["vmmemWSL", "explorer.exe"] {
-            let mut m = Monitor::new(name, Duration::from_secs(30));
-            let (st, changed) = m.poll(true);
+            let mut m = Monitor::new(name);
+            let (st, changed) = m.poll();
             eprintln!("{name}: first poll -> {st:?} changed={changed}");
             if !st.running {
                 continue;
             }
             assert!(st.cpu.is_none(), "CPU must be unknown after baseline");
             std::thread::sleep(Duration::from_millis(1500));
-            let (st, changed) = m.poll(true);
+            let (st, changed) = m.poll();
             eprintln!("{name}: second poll -> {st:?} changed={changed}");
             assert!(
                 st.cpu.is_some(),
-                "expected a CPU measurement after forced second poll"
+                "expected a CPU measurement on the next poll"
             );
             assert!(changed);
-            let (_, changed) = m.poll(false);
-            assert!(
-                !changed,
-                "unforced poll within interval should not report a change"
-            );
         }
     }
 
@@ -488,8 +475,8 @@ mod tests {
     #[test]
     #[ignore]
     fn poll_cost() {
-        let mut m = Monitor::new("vmmemWSL", Duration::from_secs(30));
-        m.poll(true); // warm up: sizes the buffer
+        let mut m = Monitor::new("vmmemWSL");
+        m.poll(); // warm up: sizes the buffer
         let n = 500;
         let t = Instant::now();
         for _ in 0..n {

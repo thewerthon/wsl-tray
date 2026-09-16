@@ -27,6 +27,10 @@ pub struct Config {
     /// (including empty) for automatic (colour while WSL2 runs, mono while
     /// it does not).
     pub icon: String,
+    /// How often, in milliseconds, to check WSL2's state and refresh the
+    /// tray icon/tooltip. `0` (or missing) keeps the built-in default (see
+    /// `-poll` in the command line help).
+    pub refreshms: u32,
 }
 
 /// Default config file name, looked up next to the executable.
@@ -60,6 +64,7 @@ impl Config {
                 "distroname" => cfg.distroname = value.to_string(),
                 "wtprofile" => cfg.wtprofile = value.to_string(),
                 "icon" => cfg.icon = value.to_string(),
+                "refreshms" => cfg.refreshms = value.parse().unwrap_or(cfg.refreshms),
                 _ => {}
             }
         }
@@ -96,7 +101,7 @@ mod tests {
     #[test]
     fn parses_the_documented_example() {
         let cfg = Config::parse(
-            "autostart = false\nautoboot = false\ndistroname = Ubuntu\nwtprofile =\nicon = auto\n",
+            "autostart = false\nautoboot = false\ndistroname = Ubuntu\nwtprofile =\nicon = auto\nrefreshms = 5000\n",
         );
         assert_eq!(
             cfg,
@@ -106,6 +111,7 @@ mod tests {
                 distroname: "Ubuntu".into(),
                 wtprofile: String::new(),
                 icon: "auto".into(),
+                refreshms: 5000,
             }
         );
     }
@@ -118,6 +124,7 @@ mod tests {
         assert_eq!(Config::default().distroname, "");
         assert_eq!(Config::default().wtprofile, "");
         assert_eq!(Config::default().icon, "");
+        assert_eq!(Config::default().refreshms, 0);
     }
 
     #[test]
@@ -131,13 +138,14 @@ mod tests {
     #[test]
     fn is_forgiving_about_case_and_spacing() {
         let cfg = Config::parse(
-            "  AUTOSTART=TRUE  \nAUTOBOOT=TRUE\nDistroName = Ubuntu\nWtProfile = Ubuntu-dev\nIcon = Mono\n",
+            "  AUTOSTART=TRUE  \nAUTOBOOT=TRUE\nDistroName = Ubuntu\nWtProfile = Ubuntu-dev\nIcon = Mono\nRefreshMs = 2000\n",
         );
         assert!(cfg.autostart);
         assert!(cfg.autoboot);
         assert_eq!(cfg.distroname, "Ubuntu");
         assert_eq!(cfg.wtprofile, "Ubuntu-dev");
         assert_eq!(cfg.icon, "Mono");
+        assert_eq!(cfg.refreshms, 2000);
     }
 
     #[test]
@@ -145,6 +153,12 @@ mod tests {
         let cfg = Config::parse("autostart = maybe\nautoboot = maybe\n");
         assert!(!cfg.autostart);
         assert!(!cfg.autoboot);
+    }
+
+    #[test]
+    fn keeps_default_on_bad_refreshms_value() {
+        let cfg = Config::parse("refreshms = soon\n");
+        assert_eq!(cfg.refreshms, 0);
     }
 
     #[test]

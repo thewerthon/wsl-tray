@@ -12,13 +12,13 @@
 //!    +-- add_tray_icon()      Shell_NotifyIconW(NIM_ADD), version 4
 //!    +-- sync_app_autostart() writes/deletes the Run key per autostart
 //!    +-- start() if autoboot  boots WSL2 in the background
-//!    +-- SetTimer(-poll)      WM_TIMER every 5 s by default
+//!    +-- SetTimer(refresh)    WM_TIMER every 5 s by default (`-poll`/`refreshms`)
 //!    +-- message loop         GetMessageW / DispatchMessageW until WM_QUIT
 //!
 //!  wnd_proc -> App::handle
 //!    WM_TIMER          -> tick(): Monitor::poll(), redraw icon/tooltip if changed
 //!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu
-//!    WM_REFRESH_NOW    -> tick(true), posted by the Start/Restart/Shutdown
+//!    WM_REFRESH_NOW    -> tick(), posted by the Start/Restart/Shutdown
 //!                         thread when its `wsl.exe` command(s) are done
 //!    TaskbarCreated    -> add_tray_icon() again after an Explorer restart
 //!    WM_DESTROY        -> remove the icon, PostQuitMessage (WSL2 itself is
@@ -162,10 +162,9 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 /// Parsed command line. Defaults are documented in [`usage`].
 struct Options {
-    /// Interval of the presence check (`-poll`).
+    /// How often to check WSL2's state and refresh the icon/tooltip
+    /// (`-poll`); overridden by `refreshms` in the config file, if set.
     poll: Duration,
-    /// Interval of the CPU/memory refresh while the VM runs (`-interval`).
-    stats: Duration,
     /// Image name of the VM process (`-process`), matched case-insensitively.
     process: String,
     /// Diagnostics log file (`-log`), appended to.
@@ -187,10 +186,10 @@ const DEFAULT_PROCESS: &str = if cfg!(feature = "win10") {
 /// because the `--process` default is chosen per build.
 fn usage() -> String {
     format!(
-        "wsltray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--config FILE]
+        "wsltray [--poll 5s] [--process {DEFAULT_PROCESS}] [--log FILE] [--config FILE]
 
-  --poll         how often to check whether WSL2 is running (cheap)
-  --interval     how often to refresh CPU/memory while WSL2 is running
+  --poll         how often to check WSL2's state and refresh the icon/tooltip
+                 (overridden by refreshms in the config file, if set)
   --process      name of the WSL2 VM process
   --log          append diagnostic log lines to this file
   --config       config file to read (default: wsltray.ini next to the exe)"
@@ -243,7 +242,6 @@ fn parse_duration(s: &str) -> Option<Duration> {
 fn parse_args() -> Result<Option<Options>, String> {
     let mut o = Options {
         poll: Duration::from_secs(5),
-        stats: Duration::from_secs(30),
         process: DEFAULT_PROCESS.into(),
         log: None,
         config: None,
@@ -269,7 +267,6 @@ fn parse_args() -> Result<Option<Options>, String> {
         };
         match key {
             "poll" => o.poll = parse_duration(&value()?).ok_or("bad --poll duration")?,
-            "interval" => o.stats = parse_duration(&value()?).ok_or("bad --interval duration")?,
             "process" => o.process = value()?,
             "log" => o.log = Some(value()?),
             "config" => o.config = Some(value()?),
@@ -453,6 +450,12 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(config::default_path);
     let config = Config::load(&config_path);
+    // `refreshms` in the config file overrides `-poll` when set.
+    let refresh = if config.refreshms > 0 {
+        Duration::from_millis(config.refreshms as u64)
+    } else {
+        opts.poll
+    };
 
     // Single instance per session: a named mutex in the Local\ namespace. If
     // it already exists another copy is running and this one exits quietly.
@@ -482,7 +485,7 @@ fn main() {
         hwnd: Cell::new(null_mut()),
         nid: RefCell::new(unsafe { std::mem::zeroed() }),
         hicon: Cell::new(null_mut()),
-        mon: RefCell::new(Monitor::new(&opts.process, opts.stats)),
+        mon: RefCell::new(Monitor::new(&opts.process)),
         icon_size,
         busy: Cell::new(Busy::Idle),
         menu_open: Cell::new(false),
@@ -505,14 +508,14 @@ fn main() {
         std::process::exit(1);
     }
     with_app(|a| {
-        a.tick(true);
+        a.tick();
         a.add_tray_icon();
         a.promote_once();
         a.sync_app_autostart();
         if a.config.autoboot {
             a.start();
         }
-        unsafe { SetTimer(a.hwnd.get(), TIMER_POLL, opts.poll.as_millis() as u32, None) };
+        unsafe { SetTimer(a.hwnd.get(), TIMER_POLL, refresh.as_millis() as u32, None) };
     });
 
     // Standard message loop. GetMessageW returns 0 on WM_QUIT and -1 on error;
@@ -600,7 +603,7 @@ impl App {
             }
             WM_TIMER => {
                 if wparam == TIMER_POLL {
-                    self.tick(false);
+                    self.tick();
                     self.promote_once();
                 }
                 Some(0)
@@ -609,7 +612,7 @@ impl App {
                 // The Start/Restart/Shutdown thread is done; re-enable the
                 // menu items and show the new state right away.
                 self.busy.set(Busy::Idle);
-                self.tick(true);
+                self.tick();
                 Some(0)
             }
             WM_CLOSE => {
@@ -643,11 +646,12 @@ impl App {
 
     /// One poll cycle: asks the [`Monitor`] for the current state and, if
     /// anything visible changed (or the icon does not exist yet), updates
-    /// the icon and tooltip. `force` bypasses the stats interval.
-    fn tick(&self, force: bool) {
-        let (st, changed) = self.mon.borrow_mut().poll(force);
+    /// the icon and tooltip. Also trims the process's working set, see
+    /// [`trim_working_set`].
+    fn tick(&self) {
+        let (st, changed) = self.mon.borrow_mut().poll();
         log!(
-            "poll force={force} -> running={} pid={} cpu={:.2} mem={} changed={changed}",
+            "poll -> running={} pid={} cpu={:.2} mem={} changed={changed}",
             st.running,
             st.pid,
             st.cpu.unwrap_or(-1.0),
