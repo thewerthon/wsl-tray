@@ -12,7 +12,8 @@
 //!    +-- add_tray_icon()      Shell_NotifyIconW(NIM_ADD), version 4
 //!    +-- sync_app_autostart() writes/deletes the Run key per autostart
 //!    +-- start() if autoboot  boots WSL2 in the background
-//!    +-- SetTimer(refresh)    WM_TIMER every 5 s by default (`-poll`/`refreshms`)
+//!    +-- SetCoalescableTimer  WM_TIMER every 5 s by default (`-poll`/`refreshms`),
+//!                             up to 20% late so it can batch with others
 //!    +-- message loop         GetMessageW / DispatchMessageW until WM_QUIT
 //!
 //!  wnd_proc -> App::handle
@@ -104,10 +105,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer,
     LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenuEx, TranslateMessage,
-    CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
+    RegisterWindowMessageW, SetCoalescableTimer, SetForegroundWindow, TrackPopupMenuEx,
+    TranslateMessage, CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+    SM_CXSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
     WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
 };
 
@@ -127,7 +128,7 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 /// for the next timer tick.
 const WM_REFRESH_NOW: u32 = WM_APP + 2;
 
-/// `SetTimer` id of the poll timer.
+/// `SetCoalescableTimer` id of the poll timer.
 const TIMER_POLL: usize = 1;
 
 // Menu command ids returned by TrackPopupMenuEx(TPM_RETURNCMD).
@@ -515,7 +516,13 @@ fn main() {
         if a.config.autoboot {
             a.start();
         }
-        unsafe { SetTimer(a.hwnd.get(), TIMER_POLL, refresh.as_millis() as u32, None) };
+        // A coalescable timer: Windows may fire it up to `tolerance` late so
+        // the wake-up can be batched with other timers on the machine,
+        // which is how a status icon should behave on battery. 20% of the
+        // interval, at most a second.
+        let ms = refresh.as_millis() as u32;
+        let tolerance = (ms / 5).clamp(1, 1000);
+        unsafe { SetCoalescableTimer(a.hwnd.get(), TIMER_POLL, ms, None, tolerance) };
     });
 
     // Standard message loop. GetMessageW returns 0 on WM_QUIT and -1 on error;

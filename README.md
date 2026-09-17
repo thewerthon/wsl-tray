@@ -124,7 +124,7 @@ wsltray.exe [-poll 5s] [-process vmmemWSL] [-log FILE] [-config FILE]
 | Flag | Default | Meaning |
 |---|---|---|
 | `-poll` | `5s` | How often to check WSL2's state and refresh the icon/tooltip. Overridden by `refreshms` in the config file, if set. |
-| `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. |
+| `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. Only looked for among session-0 (service) processes, which is where every VM process lives. |
 | `-log` | – | Append one line per poll and menu action to this file. |
 | `-config` | `wsltray.ini` next to the exe | Config file to read; see [Configuration](#configuration). |
 
@@ -142,19 +142,20 @@ Measured on Windows 11 25H2, AMD Ryzen AI MAX+ 395 (32 logical cores, 48 GB),
 | Private memory | 2.5 MB at start, 3.9 MB after half an hour |
 | Working set | 10 MB at start, ~19 MB once the menu and tooltip have been shown (shared theme and common-control DLLs) |
 | Threads | 1 while idle; up to 3 more appear briefly for GDI and the thread pool, and one runs Start/Restart/Shutdown |
-| One presence check | 3.8 ms for a full process-list snapshot (~250 processes) |
-| Idle CPU | 1.1 ms of CPU per second over a 23-minute window with the VM running (0.11 % of one core, 0.003 % of the machine) |
+| One process snapshot | A session-0 (service processes only) snapshot, a fraction of the size and cost of a full-system one |
+| Idle CPU | Lower than a full-system snapshot per poll would cost, and the poll timer is coalescable so Windows can batch its wake-up with other timers instead of waking the CPU for it alone |
 
 The only dependency is [`windows-sys`](https://crates.io/crates/windows-sys),
 which contains nothing but `extern` declarations. There is no runtime, no COM,
-no allocation on the poll path beyond reusing one buffer.
+and the poll path's only allocation is one snapshot buffer, freed right after
+it is walked.
 
 For comparison, the [original Go version](https://github.com/ideaconnect/wsl-tray/tree/80832856e8e4c4db82938dd60d8245e506c6db0a/legacy/go)
 of this program was a 2.4 MB executable using 16 MB of private memory and 8
 threads; the difference is the Go runtime.
 
 Measure it yourself: `cargo test --release -- --ignored --nocapture poll_cost`
-prints the per-poll cost on your machine.
+prints the snapshot cost on your machine.
 
 ## How it works
 
@@ -162,12 +163,18 @@ prints the per-poll cost on your machine.
   presence is the on/off signal. `wsl --list --running` is not used because
   it says "no running distributions" while the VM is still alive and holding
   memory.
-- CPU and memory come from `NtQuerySystemInformation(SystemProcessInformation)`,
-  the call Task Manager uses. It needs no handle to the process, which matters
-  because `vmmemWSL` runs as SYSTEM and `OpenProcess` on it is denied to a
-  normal user. CPU is the difference in kernel+user time between two samples
-  divided by wall time and the number of logical cores; memory is the
-  process's working set.
+- CPU and memory come from `NtQuerySystemInformation`, the call Task Manager
+  uses. It needs no handle to the process, which matters because `vmmemWSL`
+  runs as SYSTEM and `OpenProcess` on it is denied to a normal user with any
+  access mask. The process list is requested for session 0 only
+  (`SystemSessionProcessInformation`): the VM is created by the WSL service,
+  so it always lives there, and a session-0 snapshot is a fraction of the
+  size and cost of a full-system one. CPU is the difference in kernel+user
+  time between two samples divided by wall time and the number of logical
+  cores; memory is the process's working set.
+- The poll timer is a coalescable timer with a tolerance of 20 % of the
+  interval (at most a second), so Windows can batch its wake-up with other
+  timers instead of waking the CPU for it alone.
 - The tray icon is one of two embedded `.ico` files (`assets/icon-color.ico`,
   `assets/icon-mono.ico`), picked by the `icon` config key and whether WSL2 is
   running. `src/icon.rs` parses the `.ico` container directly and hands the
@@ -181,12 +188,11 @@ prints the per-poll cost on your machine.
 - The config file (`wsltray.ini`) is parsed by a small hand-written
   `key = value` reader (`src/config.rs`) rather than a crate, since it is
   parsed once at startup and the point of the exercise is staying dependency-free.
-- After every poll, `SetProcessWorkingSetSizeEx` hands back any physical pages
-  the app is not actively using. The process snapshot above is taken into a
-  buffer that grows to fit the largest process count seen (and is not shrunk
-  back), so without this the reported memory would keep reflecting that one-off
-  peak — e.g. after opening Explorer or a terminal — rather than the much
-  smaller working set the app needs between polls.
+- After every poll, `SetProcessWorkingSetSizeEx` hands back any physical
+  pages the app is not actively using. The snapshot buffer above is
+  allocated fresh per call and already freed by the time this runs, so this
+  mostly trims pages left behind by one-off menu, dialog and icon calls —
+  e.g. after opening Explorer or a terminal — rather than the process list.
 
 ## Building
 
